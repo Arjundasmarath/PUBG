@@ -1,0 +1,166 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+
+library(readr)
+library(dplyr)
+library(gridExtra)
+library(ggplot2)
+library(data.table)
+library(GGally)
+library(caret)
+library(MASS)
+library(h2o)
+library(lime)
+
+library(pdp)
+library(ranger)
+library(corrplot)
+
+cat("Reading..")
+train <- fread("../input/train_V2.csv")
+test <- fread("../input/test_V2.csv")
+
+#Let us look more into our target variable.
+summary(train$winPlacePerc)
+
+cat("Writing results")
+submission <- rep(0.4583,1934174)
+
+submission <- fread("../input/sample_submission_V2.csv")%>% mutate(winPlacePerc = submission)
+write_csv(submission,"first_submission.csv",append = FALSE)
+head(submission)
+
+train$winPlacePerc[is.na(train$winPlacePerc)] <- 0
+train$matchType <- as.factor(train$matchType)
+test$matchType <- as.factor(test$matchType)
+
+#Correlation
+train.num <- train[,c(4:15,17:29)]
+train.cor<-as.data.frame(lapply(train.num, as.numeric))
+corrplot(cor(train.cor),method = "circle")
+
+table(train$winPlacePerc[train$numGroups == 1])
+
+train.new <- train%>% mutate(kmperhour = (walkDistance/1000)/(matchDuration/3600))
+ggplot(train.new,aes(kmperhour))+geom_histogram(bins =500,fill = "DarkRed")+labs("Walk Distance Perhour")
+
+train$cheaters <- 0
+train$cheaters[train$kmperhour > 20] <- 1
+
+test$cheaters <- 0
+test$cheaters[test$kmperhour > 20] <- 1
+
+#Kills
+#table( train$kills > 40 )
+train$killer_flag <- 0
+train$killer_flag[train$kills > 40] <- 1
+
+test$killer_flag <- 0
+test$killer_flag[test$kills > 40] <- 1
+
+train$headshot_rate <- 0
+test$headshot_rate <- 0
+train$headshot_rate <- train$headshotKills / train$kills
+test$headshot_rate <- test$headshotKills / test$kills
+table(train$headshot_rate)
+
+zombies <- train %>%filter(walkDistance == 0 , weaponsAcquired==0)
+totalMatches<-length(unique(train$matchId))
+zombies<-summarise(group_by(zombies,matchId),ZombieCount=n()
+                                            ,meanWinPlacePerc=mean(winPlacePerc,na.rm=T)
+                                            ,IsSolo=max(ifelse(grepl("solo", matchType, fixed=TRUE)==T,1,0))
+                                            ,IsDuo=max(ifelse(grepl("duo", matchType, fixed=TRUE)==T,1,0))
+                                            ,IsSquad=max(ifelse(grepl("squad", matchType, fixed=TRUE)==T,1,0)))%>%mutate(row=row_number())
+
+head(zombies)
+
+
+# Inspired from https://www.kaggle.com/pecooper/pubg-eda-findings-model-and-tricks-0-0246-lb.Please check this
+
+combat_scores <-function(x){
+    x <- x %>% mutate(combatScore = ((damageDealt/100)*10)+(kills*10)+(-teamKills*20)+(DBNOs*10),
+                teamWorkScore = (assists*20)+(revives*50),
+                walkDistance = ifelse((walkDistance/1000)/(matchDuration/60/60)>22,22000,walkDistance),
+                averageDistancePerMinute = (walkDistance+rideDistance+swimDistance)/(matchDuration/60),
+                weaponsPerMinute = weaponsAcquired/(matchDuration/60),
+                itemsCollected = (weaponsAcquired+heals+boosts)                
+                )
+  return(x)
+}
+
+match_types <- function(x){
+x<-x%>%mutate(isSolo = ifelse(x$matchType=='solo-fpp' | x$matchType=='solo' |
+                                x$matchType=='normal-solo-fpp' | x$matchType=='solo' |
+                                x$matchType=='normal-solo',1,0),
+                                
+                isDuo = ifelse(x$matchType=='duo' | x$matchType=='duo-fpp' |
+                                x$matchType=='normal-duo-fpp' | x$matchType=='normal-duo' ,1,0),
+                                
+                isSquad = ifelse(x$matchType=='squad-fpp' | x$matchType=='squad' |
+                                x$matchType=='normal-squad-fpp' | x$matchType=='normal-squad' ,1,0),
+                                
+                                
+                isCrash = ifelse(x$matchType=='crashfpp' | x$matchType=='crashtpp',1,0),
+                isFlare = ifelse(x$matchType=='flaretpp' | x$matchType=='flarefpp',1,0))
+                
+x<-unique(x%>%select(matchId,isSolo,isDuo,isSquad,isCrash,isFlare))
+return (x)
+}
+
+#For training we will remove any matches were numGroups ==1 as we know these will always be 0
+train<-train%>%filter(numGroups>1)
+
+# <- match_types(train)
+train <- combat_scores(train)
+
+cat("splitting data")
+train.rows <- createDataPartition(train$winPlacePerc,p=0.8, list = FALSE)
+train1 <- train[train.rows,]
+test1 <- train[-train.rows,]
+str(train)
+
+localH2O <- h2o.init(nthreads = -1)
+h2o.init()
+
+train1.h2o <- as.h2o(train1)
+test1.h2o <- as.h2o(test1)
+test.h2o <- as.h2o(test)
+
+y.dep <- 29
+x.indep <- c(4:28,30:31)
+
+cat("Running DL")
+dlearning.model <- h2o.deeplearning(y = y.dep,
+             x = x.indep,
+             training_frame = train1.h2o,
+             epoch = 60,
+             hidden = c(100,100),
+             activation = "Rectifier",
+             seed = 1122
+             )
+			 
+result <-as.data.frame(h2o.predict(dlearning.model,test1.h2o))
+head(result)
+MAE(result$predict,test1$winPlacePerc)
+
+
+
+train1 <- as.data.frame(unclass(train1))
+test1 <- as.data.frame(unclass(test1))
+
+#result_real <- predict(model_lm1,test)
+result_dl <- as.data.frame(h2o.predict(dlearning.model,test.h2o))
+
+cat("Writing results")
+submission <- fread("../input/sample_submission_V2.csv")%>% mutate(winPlacePerc = result_dl$predict)
+write_csv(submission,"submission_dl.csv",append = FALSE)
+head(submission)
+
+```
+
